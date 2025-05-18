@@ -1,0 +1,183 @@
+#!/bin/bash
+#
+# pmount: Permanent Mount script
+# Adds a filesystem entry to /etc/fstab using UUID and attempts to mount it.
+# Designed for use by a system administrator after creating and formatting a new block device,
+# such as an LVM Logical Volume, and wants to ensure it's mounted automatically on boot.
+#
+# Usage: pmount <block_device_path> <mount_point_directory>
+# Example: pmount /dev/myvg/data /data
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+# Treat unset variables as an error when substituting.
+set -u
+
+# --- Configuration ---
+SCRIPT_VERSION="1.0"
+SCRIPT_NAME="$(basename "$0")"
+EXPECTED_ARGS=2 # Number of arguments required for the main command functionality
+FSTAB_FILE="/etc/fstab"
+
+# --- Helper Functions for Usage and Error Output ---
+
+# Prints the correct usage and command description
+print_usage() {
+  echo "Usage: $SCRIPT_NAME <block_device_path> <mount_point_directory>" >&2
+  echo "Example: $SCRIPT_NAME /dev/myvg/data /data" >&2
+  echo "" >&2 # Blank line for readability
+  echo "Adds a filesystem entry to $FSTAB_FILE using UUID and attempts to mount it." >&2
+  echo "Requires root privileges." >&2
+  echo "" >&2 # Blank line for readability
+  echo "Options:" >&2
+  echo "  --version  Show script version" >&2
+  echo "  --help, -h Show this help message" >&2
+}
+
+# Prints an error message to standard error and exits with status 1
+error_exit() {
+  echo "Error: $1" >&2
+  echo "" >&2 # Print a blank line after the specific error
+  print_usage # Call the usage function to show correct syntax
+  exit 1
+}
+
+# Prints a warning message to standard error
+warn() {
+  echo "Warning: $1" >&2
+}
+
+# Prints an informational message to standard output
+info() {
+  echo "Info: $1"
+}
+
+# --- Check for Root Privileges ---
+if [[ $EUID -ne 0 ]]; then
+   error_exit "This script must be run as root or with sudo."
+fi
+
+# --- Version/Help Handling (Check for single arguments first) ---
+# This block handles requests for version or help before doing main argument validation
+if [[ "$#" -eq 1 ]]; then
+  case "$1" in
+    "--version")
+      echo "$SCRIPT_NAME version $SCRIPT_VERSION"
+      exit 0 # Exit successfully after showing version
+      ;;
+    "--help" | "-h")
+      print_usage # Call the usage function
+      exit 0      # Exit successfully after showing help
+      ;;
+    *) # Handle case where there is 1 argument, but it's not --version or --help
+      error_exit "Invalid argument: '$1'" # Treat any other single argument as an error
+      ;;
+  esac
+fi
+# --- End Version/Help Handling ---
+
+
+# --- Main Argument Validation ---
+# If we reach here, it wasn't just a single option.
+# Now check if the number of arguments matches the expected count for the main task.
+if [ $# -ne $EXPECTED_ARGS ]; then
+  # If the count is wrong (and it wasn't a single --help/--version handled above), show error and usage
+  error_exit "Incorrect number of arguments. Expected $EXPECTED_ARGS for command, but received $#."
+fi
+
+# --- Assign Arguments to Variables ---
+DEVICE_PATH="$1"
+MOUNT_POINT="$2"
+
+# This check is technically redundant due to $# check for EXPECTED_ARGS=2 and 'set -u', but good for clarity
+if [ -z "$DEVICE_PATH" ] || [ -z "$MOUNT_POINT" ]; then
+    error_exit "Device path and mount point cannot be empty."
+fi
+
+
+# --- Validate Device Path ---
+info "Validating device path: '$DEVICE_PATH'"
+if [ ! -b "$DEVICE_PATH" ]; then
+    error_exit "Device path '$DEVICE_PATH' does not exist or is not a block device."
+fi
+
+# --- Validate Mount Point ---
+info "Validating mount point: '$MOUNT_POINT'"
+# Require mount point directory to exist
+if [ ! -d "$MOUNT_POINT" ]; then
+    # If you wanted to allow creation, add a prompt here or an option flag
+    error_exit "Mount point '$MOUNT_POINT' does not exist or is not a directory."
+fi
+
+
+# --- Get Filesystem UUID and Type ---
+info "Getting filesystem UUID and type for '$DEVICE_PATH'"
+# Use blkid with -o value and -s for robust property retrieval
+# Redirect stderr to /dev/null in case blkid outputs warnings for certain device states
+UUID=$(blkid -o value -s UUID "$DEVICE_PATH" 2>/dev/null)
+if [ -z "$UUID" ]; then
+    error_exit "Could not find a filesystem UUID for device '$DEVICE_PATH'. Is it formatted?"
+fi
+info "Found UUID: $UUID"
+
+FSTYPE=$(blkid -o value -s TYPE "$DEVICE_PATH" 2>/dev/null)
+if [ -z "$FSTYPE" ]; then
+    warn "Could not determine filesystem type for device '$DEVICE_PATH'. Using 'auto' in fstab."
+    FSTYPE="auto" # Use 'auto' as a fallback type in fstab
+else
+    info "Found Filesystem Type: $FSTYPE"
+fi
+
+
+# --- Prepare fstab Entry String ---
+FSTAB_ENTRY="UUID=$UUID $MOUNT_POINT $FSTYPE defaults 0 0"
+info "Proposed fstab entry: '$FSTAB_ENTRY'"
+
+
+# --- Handle /etc/fstab (Idempotent Check/Add) ---
+info "Checking $FSTAB_FILE for existing entries before adding..."
+
+# Check if an entry with the same UUID already exists
+# grep -q suppresses output, returns 0 if found, 1 if not
+if grep -q "^UUID=$UUID" "$FSTAB_FILE"; then
+    warn "An entry for UUID $UUID already exists in $FSTAB_FILE."
+    # Exit to prevent duplicates. More advanced versions could offer to update/replace.
+    error_exit "Entry based on UUID already exists. Please check and edit $FSTAB_FILE manually if needed."
+fi
+
+# Check if an entry with the same mount point already exists (ignoring comment lines)
+# Uses regex to match a line not starting with #, containing whitespace then the mount point, then whitespace.
+if grep -q "^[^#].*[[:space:]]$MOUNT_POINT[[:space:]]" "$FSTAB_FILE"; then
+    warn "An entry for mount point $MOUNT_POINT already exists in $FSTAB_FILE."
+    error_exit "Entry based on mount point already exists. Please check and edit $FSTAB_FILE manually if needed."
+fi
+
+# If no existing entry found, add the new one
+info "No conflicting entry found. Adding new entry to $FSTAB_FILE..."
+echo "$FSTAB_ENTRY" >> "$FSTAB_FILE"
+# set -e will handle the error if echo fails (e.g., permissions, disk full)
+
+info "Entry added successfully."
+
+
+# --- Attempt to Mount ---
+# This step verifies the fstab entry syntax and device availability
+info "Attempting to mount filesystem from $FSTAB_FILE entries (using mount -a)..."
+mount -a
+# set -e will handle the error if mount -a fails (e.g., fstab syntax error, device not available)
+
+info "Mount successful via mount -a. The new entry appears valid."
+
+
+# --- Final Verification (Optional but good practice) ---
+# Check if the specific mount point is active using findmnt
+if findmnt "$MOUNT_POINT" > /dev/null; then
+  info "Verification: '$DEVICE_PATH' is now mounted at '$MOUNT_POINT'."
+else
+  # This should ideally not happen if mount -a succeeded with set -e, but provides an extra check
+  warn "Verification: Could not confirm '$DEVICE_PATH' is mounted at '$MOUNT_POINT' using findmnt after mount -a."
+fi
+
+info "Script finished. Filesystem is permanently configured and mounted."
+
+exit 0 # Explicit success exit
