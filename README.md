@@ -10,7 +10,11 @@ It is particularly useful after creating new block devices like LVM Logical Volu
 
 pmount - add a filesystem entry to /etc/fstab using UUID and mount it
 ## INSTALLATION
-Download .rpm file
+Download .rpm file:
+
+`wget https://github.com/mishrahrishikesh/pmount-custom-linux-cmd/blob/main/pmount-1.0-1.amzn2023.noarch.rpm`
+
+Install:
 
 `yum install <rpm-file>.rpm`
 
